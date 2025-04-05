@@ -1,0 +1,6 @@
+**/pretrained_models/
+**/test-other/
+**/users/
+**/*.m4a
+**/*.wav
+**/__pycache__
