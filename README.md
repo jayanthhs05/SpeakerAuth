@@ -30,10 +30,12 @@ Returns:
 {
     "authenticated":true/false,
     "similarity_score":0.xxxxxx,
-    "threshold":0.6
+    "threshold":0.6,
+    "transcription": "text goes here"
 }
 ```
 
 If there is some server error or file not found or any such error, the error will be returned with a status code != 200.
 
 To change the threshold, edit the `THRESHOLD` parameter in the code file.
+To change the whisper model, edit the `whisper.load_model(...)` to whatever size you need.
