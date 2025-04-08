@@ -4,3 +4,5 @@
 **/*.m4a
 **/*.wav
 **/__pycache__
+**/.env
+**/test_gemini.py

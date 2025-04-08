@@ -1,19 +1,26 @@
 from io import BytesIO
 import os
-from torch import mean
+import torch
 import numpy as np
 import torchaudio
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from speechbrain.inference import SpeakerRecognition
-from sklearn.metrics.pairwise import cosine_similarity
 import uvicorn
 from fastapi.encoders import jsonable_encoder
 import whisper
 
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.backends.cudnn.benchmark = True
+THRESHOLD = 0.4
+SAMPLE_RATE = 16000
+USERS_DIR = "users/"
+os.makedirs(USERS_DIR, exist_ok=True)
+
 app = FastAPI()
 
-# Enable CORS for cross-device communication
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,105 +29,121 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load models
+
 verification_system = SpeakerRecognition.from_hparams(
-    source="speechbrain/spkrec-ecapa-voxceleb", 
-    savedir="pretrained_models/"
-)
-model = whisper.load_model("medium")
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    savedir="pretrained_models/",
+    run_opts={"device": device},
+).eval()
 
-# Configuration
-THRESHOLD = 0.4
-SAMPLE_RATE = 16000
-USERS_DIR = "users/"
-os.makedirs(USERS_DIR, exist_ok=True)
+whisper_model = whisper.load_model("medium", device=device)
+if device == "cuda":
+    whisper_model = whisper_model.half()
 
-def process_audio(audio_data: bytes):
+
+def process_audio(audio_data: bytes) -> torch.Tensor:
     """Process uploaded audio data into waveform"""
     try:
         audio_buffer = BytesIO(audio_data)
         waveform, orig_freq = torchaudio.load(audio_buffer)
-        
-        # Convert to mono if stereo
-        if waveform.shape[0] > 1:
-            waveform = mean(waveform, dim=0, keepdim=True)
-            
-        # Resample if necessary
-        if orig_freq != SAMPLE_RATE:
-            waveform = torchaudio.functional.resample(
-                waveform, 
-                orig_freq, 
-                SAMPLE_RATE
-            )
-            
-        return waveform
+
+        waveform = torchaudio.functional.resample(
+            waveform.mean(dim=0, keepdim=True),
+            orig_freq=orig_freq,
+            new_freq=SAMPLE_RATE,
+        )
+
+        return waveform.to(device, non_blocking=True)
     except Exception as e:
         raise HTTPException(400, f"Audio processing failed: {str(e)}")
 
-def verify_speaker(profile_path: str, waveform):
-    """Verify speaker against stored profile"""
+
+def verify_speaker(profile_path: str, waveform: torch.Tensor) -> dict:
     try:
-        enrolled_embedding = np.load(profile_path)
-        new_embedding = verification_system.encode_batch(waveform)
-        new_embedding = new_embedding.squeeze().detach().numpy()
-        
-        # Calculate similarity score
-        similarity_score = cosine_similarity(
-            enrolled_embedding.reshape(1, -1),
-            new_embedding.reshape(1, -1)
-        )[0][0]
-        
+        enrolled_embedding = torch.load(profile_path, map_location=device)
+
+        enrolled_embedding = enrolled_embedding.view(1, -1)
+
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device == "cuda")):
+            new_embedding = verification_system.encode_batch(waveform)
+
+        new_embedding = new_embedding.reshape(1, -1)
+
+        similarity_score = torch.cosine_similarity(
+            enrolled_embedding, new_embedding, dim=1
+        ).item()
+
         return {
-            "authenticated": bool(similarity_score >= THRESHOLD),
-            "similarity_score": float(similarity_score),
-            "threshold": float(THRESHOLD)
-        }
+            "authenticated": similarity_score >= THRESHOLD,
+            "similarity_score": similarity_score,
+            "threshold": THRESHOLD,
+        }   
     except Exception as e:
         raise HTTPException(500, f"Verification failed: {str(e)}")
+
 
 @app.post("/enroll")
 async def enroll_user(user_id: str = Form(...), file: UploadFile = File(...)):
     """Enroll a new user with voice sample"""
-    if os.path.exists(os.path.join(USERS_DIR, f"{user_id}.npy")):
-        raise HTTPException(400, "User already exists")
-    
+    profile_path = os.path.join(USERS_DIR, f"{user_id}.pt")
+    # if os.path.exists(profile_path):
+    #     raise HTTPException(400, "User already exists")
+
     try:
-        # Read and process audio
         audio_data = await file.read()
         waveform = process_audio(audio_data)
-        
-        # Generate and save embedding
-        embedding = verification_system.encode_batch(waveform)
-        embedding = embedding.detach().numpy()
-        np.save(os.path.join(USERS_DIR, f"{user_id}.npy"), embedding)
-        
+
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device == "cuda")):
+            embedding = verification_system.encode_batch(waveform)
+
+        torch.save(embedding.cpu(), profile_path)
+        torch.cuda.empty_cache()
+
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(500, str(e))
 
+
 @app.post("/verify")
 async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
-    profile_path = os.path.join(USERS_DIR, f"{user_id}.npy")
+    """Verify a user's voice sample against their enrolled profile"""
+    profile_path = os.path.join(USERS_DIR, f"{user_id}.pt")
     if not os.path.exists(profile_path):
         raise HTTPException(404, "User not found")
-    
+
     try:
         audio_data = await file.read()
         waveform = process_audio(audio_data)
+
         verification_result = verify_speaker(profile_path, waveform)
-        audio_np = waveform.squeeze().numpy().astype(np.float32)
-        result = model.transcribe(audio_np)
-        verification_result["transcription"] = result["text"]
-        
+
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device == "cuda")):
+            audio_np = waveform.squeeze().cpu().numpy().astype(np.float32)
+            transcription_result = whisper_model.transcribe(
+                audio_np, fp16=(device == "cuda")
+            )
+
+        verification_result["transcription"] = transcription_result["text"]
+
         return jsonable_encoder(verification_result)
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        torch.cuda.empty_cache()
 
 
 @app.get("/health")
 async def health_check():
-    """Service health check"""
-    return {"status": "ok", "model_loaded": True}
+    """Service health check endpoint"""
+    return {
+        "status": "ok",
+        "cuda_available": torch.cuda.is_available(),
+        "device": device,
+        "cuda_mem_allocated": (
+            f"{torch.cuda.memory_allocated()/1e9:.2f} GB" if device == "cuda" else None
+        ),
+    }
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
